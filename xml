@@ -1,0 +1,9 @@
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
+<uses-permission android:name="android.permission.VIBRATE" />
+<key>NSMicrophoneUsageDescription</key>
+<string>Echo Realm uses your microphone to control gameplay.</string>
+flutter create echo_realm
+cd echo_realm
+# Replace pubspec.yaml and lib/ with files above
+flutter pub get
+flutter run
