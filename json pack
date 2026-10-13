@@ -1,0 +1,727 @@
+{
+  "name": "echo-realm",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios"
+  },
+  "dependencies": {
+    "expo": "~49.0.0",
+    "expo-av": "~13.4.0",
+    "expo-haptics": "~12.2.0",
+    "expo-sensors": "~12.3.0",
+    "react": "18.2.0",
+    "react-native": "0.72.6",
+    "react-native-gesture-handler": "~2.12.0",
+    "react-native-reanimated": "~3.3.0",
+    "react-native-svg": "13.9.0",
+    "@react-native-async-storage/async-storage": "1.18.2"
+  }
+}
+import React, { useState, useEffect } from 'react';
+import { View, StyleSheet, StatusBar } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import MainMenu from './src/screens/MainMenu';
+import GameScreen from './src/screens/GameScreen';
+import GameOver from './src/screens/GameOver';
+import { AudioProvider } from './src/context/AudioContext';
+import { GameProvider } from './src/context/GameContext';
+
+export default function App() {
+  const [screen, setScreen] = useState('menu');
+  const [score, setScore] = useState(0);
+
+  return (
+    <GestureHandlerRootView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0a1a" />
+      <AudioProvider>
+        <GameProvider>
+          {screen === 'menu' && <MainMenu onStart={() => setScreen('game')} />}
+          {screen === 'game' && (
+            <GameScreen 
+              onGameOver={(finalScore) => {
+                setScore(finalScore);
+                setScreen('over');
+              }} 
+            />
+          )}
+          {screen === 'over' && (
+            <GameOver 
+              score={score} 
+              onRestart={() => setScreen('game')}
+              onMenu={() => setScreen('menu')}
+            />
+          )}
+        </GameProvider>
+      </AudioProvider>
+    </GestureHandlerRootView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#0a0a1a' }
+});
+import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import { Audio } from 'expo-av';
+
+const AudioContext = createContext();
+
+export const useAudio = () => useContext(AudioContext);
+
+export const AudioProvider = ({ children }) => {
+  const [volume, setVolume] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const recordingRef = useRef(null);
+
+  const startListening = async () => {
+    try {
+      const { status } = await Audio.requestPermissionsAsync();
+      if (status !== 'granted') return;
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        (status) => {
+          // Metering gives us volume in dB (-160 to 0)
+          if (status.metering !== undefined) {
+            // Convert dB to 0-100 scale
+            const normalized = Math.max(0, Math.min(100, (status.metering + 60) * 1.67));
+            setVolume(normalized);
+          }
+        },
+        100
+      );
+      recordingRef.current = recording;
+      setIsRecording(true);
+    } catch (err) {
+      console.error('Recording error:', err);
+    }
+  };
+
+  const stopListening = async () => {
+    if (recordingRef.current) {
+      await recordingRef.current.stopAndUnloadAsync();
+      recordingRef.current = null;
+      setIsRecording(false);
+      setVolume(0);
+    }
+  };
+
+  useEffect(() => {
+    return () => { stopListening(); };
+  }, []);
+
+  return (
+    <AudioContext.Provider value={{ 
+      volume, 
+      isRecording, 
+      startListening, 
+      stopListening 
+    }}>
+      {children}
+    </AudioContext.Provider>
+  );
+};
+import React, { createContext, useContext, useReducer, useEffect } from 'react';
+
+const GameContext = createContext();
+export const useGame = () => useContext(GameContext);
+
+const initialState = {
+  health: 100,
+  energy: 100,
+  score: 0,
+  level: 1,
+  enemies: [],
+  particles: [],
+  combo: 0,
+  time: 0,
+};
+
+function reducer(state, action) {
+  switch (action.type) {
+    case 'TICK':
+      return { ...state, time: state.time + 1 };
+    case 'DAMAGE':
+      return { ...state, health: Math.max(0, state.health - action.payload) };
+    case 'HEAL':
+      return { ...state, health: Math.min(100, state.health + action.payload) };
+    case 'ADD_SCORE':
+      return { ...state, score: state.score + action.payload, combo: state.combo + 1 };
+    case 'SPAWN_ENEMY':
+      return { ...state, enemies: [...state.enemies, action.payload] };
+    case 'REMOVE_ENEMY':
+      return { ...state, enemies: state.enemies.filter(e => e.id !== action.payload) };
+    case 'RESET':
+      return initialState;
+    default:
+      return state;
+  }
+}
+
+export const GameProvider = ({ children }) => {
+  const [state, dispatch] = useReducer(reducer, initialState);
+
+  // Game loop - 60 FPS tick
+  useEffect(() => {
+    const interval = setInterval(() => dispatch({ type: 'TICK' }), 1000 / 60);
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <GameContext.Provider value={{ state, dispatch }}>
+      {children}
+    </GameContext.Provider>
+  );
+};
+import React, { useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Animated, Dimensions } from 'react-native';
+import Svg, { Circle, Defs, RadialGradient, Stop } from 'react-native-svg';
+
+const { width, height } = Dimensions.get('window');
+
+export default function MainMenu({ onStart }) {
+  const pulse = useRef(new Animated.Value(1)).current;
+  const float = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1.1, duration: 1500, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1, duration: 1500, useNativeDriver: true }),
+      ])
+    ).start();
+
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(float, { toValue: 1, duration: 3000, useNativeDriver: true }),
+        Animated.timing(float, { toValue: 0, duration: 3000, useNativeDriver: true }),
+      ])
+    ).start();
+  }, []);
+
+  const translateY = float.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, -20],
+  });
+
+  return (
+    <View style={styles.container}>
+      <Svg height={height} width={width} style={StyleSheet.absoluteFill}>
+        <Defs>
+          <RadialGradient id="glow" cx="50%" cy="50%" r="50%">
+            <Stop offset="0%" stopColor="#7c3aed" stopOpacity="0.6" />
+            <Stop offset="100%" stopColor="#0a0a1a" stopOpacity="0" />
+          </RadialGradient>
+        </Defs>
+        <Circle cx={width / 2} cy={height / 2} r={width} fill="url(#glow)" />
+      </Svg>
+
+      <Animated.View style={[styles.titleBox, { transform: [{ translateY }] }]}>
+        <Text style={styles.title}>ECHO</Text>
+        <Text style={styles.titleAccent}>REALM</Text>
+        <Text style={styles.subtitle}>Speak. Shout. Survive.</Text>
+      </Animated.View>
+
+      <Animated.View style={{ transform: [{ scale: pulse }] }}>
+        <TouchableOpacity style={styles.button} onPress={onStart} activeOpacity={0.8}>
+          <Text style={styles.buttonText}>▶ BEGIN</Text>
+        </TouchableOpacity>
+      </Animated.View>
+
+      <Text style={styles.hint}>🎤 Uses microphone for gameplay</Text>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0a0a1a',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  titleBox: { alignItems: 'center', marginBottom: 60 },
+  title: {
+    fontSize: 72,
+    fontWeight: '900',
+    color: '#fff',
+    letterSpacing: 8,
+    textShadowColor: '#7c3aed',
+    textShadowRadius: 20,
+  },
+  titleAccent: {
+    fontSize: 72,
+    fontWeight: '900',
+    color: '#7c3aed',
+    letterSpacing: 8,
+    marginTop: -20,
+    textShadowColor: '#fff',
+    textShadowRadius: 20,
+  },
+  subtitle: {
+    color: '#a0a0c0',
+    fontSize: 16,
+    letterSpacing: 4,
+    marginTop: 20,
+    fontStyle: 'italic',
+  },
+  button: {
+    backgroundColor: '#7c3aed',
+    paddingHorizontal: 60,
+    paddingVertical: 20,
+    borderRadius: 50,
+    borderWidth: 2,
+    borderColor: '#a78bfa',
+    shadowColor: '#7c3aed',
+    shadowRadius: 20,
+    shadowOpacity: 1,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 10,
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 3,
+  },
+  hint: {
+    position: 'absolute',
+    bottom: 40,
+    color: '#666',
+    fontSize: 12,
+    letterSpacing: 1,
+  },
+});
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, StyleSheet, Dimensions, Animated } from 'react-native';
+import Svg, { Circle, Line, G } from 'react-native-svg';
+import * as Haptics from 'expo-haptics';
+import { useAudio } from '../context/AudioContext';
+import { useGame } from '../context/GameContext';
+
+const { width, height } = Dimensions.get('window');
+const PLAYER_SIZE = 40;
+
+export default function GameScreen({ onGameOver }) {
+  const { volume, startListening, stopListening } = useAudio();
+  const { state, dispatch } = useGame();
+  const [shockwave, setShockwave] = useState(null);
+  const [playerPos, setPlayerPos] = useState({ x: width / 2, y: height - 150 });
+  const spawnTimer = useRef(0);
+  const lastVolume = useRef(0);
+
+  // Start listening on mount
+  useEffect(() => {
+    startListening();
+    return () => stopListening();
+  }, []);
+
+  // Voice → Action mapping
+  useEffect(() => {
+    if (volume > 60) {
+      // SHOUT = Shockwave attack
+      triggerShockwave(volume);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    } else if (volume > 20 && volume < 40) {
+      // WHISPER = Heal
+      dispatch({ type: 'HEAL', payload: 0.2 });
+    }
+    lastVolume.current = volume;
+  }, [volume]);
+
+  const triggerShockwave = (power) => {
+    const sw = {
+      id: Date.now(),
+      x: playerPos.x,
+      y: playerPos.y,
+      radius: 0,
+      power,
+    };
+    setShockwave(sw);
+
+    // Damage enemies in range
+    state.enemies.forEach(enemy => {
+      const dist = Math.hypot(enemy.x - playerPos.x, enemy.y - playerPos.y);
+      if (dist < 200) {
+        dispatch({ type: 'REMOVE_ENEMY', payload: enemy.id });
+        dispatch({ type: 'ADD_SCORE', payload: 100 });
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      }
+    });
+
+    // Animate shockwave
+    let r = 0;
+    const anim = setInterval(() => {
+      r += 15;
+      setShockwave(prev => prev ? { ...prev, radius: r } : null);
+      if (r > 400) {
+        clearInterval(anim);
+        setShockwave(null);
+      }
+    }, 16);
+  };
+
+  // Enemy spawning
+  useEffect(() => {
+    const interval = setInterval(() => {
+      dispatch({
+        type: 'SPAWN_ENEMY',
+        payload: {
+          id: Date.now() + Math.random(),
+          x: Math.random() * (width - 60) + 30,
+          y: -30,
+          speed: 1 + Math.random() * 2 + state.level * 0.3,
+          hp: 1,
+        },
+      });
+    }, Math.max(800, 2000 - state.level * 100));
+    return () => clearInterval(interval);
+  }, [state.level]);
+
+  // Move enemies + collision detection
+  useEffect(() => {
+    const frame = setInterval(() => {
+      state.enemies.forEach(enemy => {
+        enemy.y += enemy.speed;
+        if (enemy.y > height) {
+          dispatch({ type: 'REMOVE_ENEMY', payload: enemy.id });
+          dispatch({ type: 'DAMAGE', payload: 10 });
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        }
+        // Collision with player
+        if (Math.hypot(enemy.x - playerPos.x, enemy.y - playerPos.y) < 40) {
+          dispatch({ type: 'REMOVE_ENEMY', payload: enemy.id });
+          dispatch({ type: 'DAMAGE', payload: 15 });
+        }
+      });
+    }, 16);
+    return () => clearInterval(frame);
+  }, [state.enemies, playerPos]);
+
+  // Player movement via touch (position follows finger x)
+  const handleTouch = (e) => {
+    const x = e.nativeEvent.locationX;
+    setPlayerPos(prev => ({ ...prev, x: Math.max(30, Math.min(width - 30, x)) }));
+  };
+
+  // Game over
+  useEffect(() => {
+    if (state.health <= 0) onGameOver(state.score);
+  }, [state.health]);
+
+  // Level up
+  useEffect(() => {
+    const newLevel = Math.floor(state.score / 1000) + 1;
+    if (newLevel !== state.level) {
+      // Trigger level up effect
+    }
+  }, [state.score]);
+
+  const volumeColor = volume > 60 ? '#ef4444' : volume > 20 ? '#22c55e' : '#3b82f6';
+
+  return (
+    <View 
+      style={styles.container}
+      onStartShouldSetResponder={() => true}
+      onResponderMove={handleTouch}
+      onResponderGrant={handleTouch}
+    >
+      {/* Starfield background */}
+      <Svg height={height} width={width} style={StyleSheet.absoluteFill}>
+        {Array.from({ length: 60 }).map((_, i) => (
+          <Circle
+            key={i}
+            cx={(i * 137.5) % width}
+            cy={(i * 73.3) % height}
+            r={1 + (i % 3) * 0.5}
+            fill="#fff"
+            opacity={0.3 + (i % 5) * 0.1}
+          />
+        ))}
+      </Svg>
+
+      {/* HUD */}
+      <View style={styles.hud}>
+        <View style={styles.healthBar}>
+          <View style={[styles.healthFill, { width: `${state.health}%` }]} />
+        </View>
+        <Text style={styles.score}>⚡ {state.score}</Text>
+        <Text style={styles.level}>LV {state.level}</Text>
+      </View>
+
+      {/* Volume meter */}
+      <View style={styles.volumeMeter}>
+        <View style={[styles.volumeFill, { width: `${volume}%`, backgroundColor: volumeColor }]} />
+        <Text style={styles.volumeLabel}>
+          {volume > 60 ? '🔥 SHOUT!' : volume > 20 ? '💚 WHISPER' : '🎤 SPEAK'}
+        </Text>
+      </View>
+
+      {/* Enemies */}
+      <Svg height={height} width={width} style={StyleSheet.absoluteFill}>
+        {state.enemies.map(enemy => (
+          <G key={enemy.id}>
+            <Circle cx={enemy.x} cy={enemy.y} r={25} fill="#ef4444" opacity={0.4} />
+            <Circle cx={enemy.x} cy={enemy.y} r={18} fill="#dc2626" />
+            <Circle cx={enemy.x} cy={enemy.y} r={8} fill="#7f1d1d" />
+            <Circle cx={enemy.x - 5} cy={enemy.y - 3} r={3} fill="#fff" />
+            <Circle cx={enemy.x + 5} cy={enemy.y - 3} r={3} fill="#fff" />
+          </G>
+        ))}
+
+        {/* Player */}
+        <G>
+          <Circle cx={playerPos.x} cy={playerPos.y} r={30} fill="#7c3aed" opacity={0.3} />
+          <Circle cx={playerPos.x} cy={playerPos.y} r={20} fill="#a78bfa" />
+          <Circle cx={playerPos.x} cy={playerPos.y} r={10} fill="#fff" />
+        </G>
+
+        {/* Shockwave */}
+        {shockwave && (
+          <>
+            <Circle
+              cx={shockwave.x}
+              cy={shockwave.y}
+              r={shockwave.radius}
+              stroke="#7c3aed"
+              strokeWidth={4}
+              fill="none"
+              opacity={Math.max(0, 1 - shockwave.radius / 400)}
+            />
+            <Circle
+              cx={shockwave.x}
+              cy={shockwave.y}
+              r={shockwave.radius * 0.7}
+              stroke="#a78bfa"
+              strokeWidth={2}
+              fill="none"
+              opacity={Math.max(0, 1 - shockwave.radius / 400)}
+            />
+          </>
+        )}
+      </Svg>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#0a0a1a' },
+  hud: {
+    position: 'absolute',
+    top: 50,
+    left: 20,
+    right: 20,
+    zIndex: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  healthBar: {
+    flex: 1,
+    height: 12,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 6,
+    overflow: 'hidden',
+    marginRight: 15,
+    borderWidth: 1,
+    borderColor: '#333',
+  },
+  healthFill: {
+    height: '100%',
+    backgroundColor: '#22c55e',
+    borderRadius: 6,
+  },
+  score: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginRight: 15 },
+  level: { color: '#a78bfa', fontSize: 14, fontWeight: 'bold' },
+  volumeMeter: {
+    position: 'absolute',
+    bottom: 30,
+    left: 30,
+    right: 30,
+    height: 8,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 4,
+    overflow: 'hidden',
+    zIndex: 10,
+  },
+  volumeFill: { height: '100%', borderRadius: 4 },
+  volumeLabel: {
+    color: '#fff',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 8,
+    letterSpacing: 2,
+  },
+});
+import React, { useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Animated } from 'react-native';
+
+export default function GameOver({ score, onRestart, onMenu }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const slide = useRef(new Animated.Value(50)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fade, { toValue: 1, duration: 600, useNativeDriver: true }),
+      Animated.timing(slide, { toValue: 0, duration: 600, useNativeDriver: true }),
+    ]).start();
+  }, []);
+
+  return (
+    <View style={styles.container}>
+      <Animated.View style={{ opacity: fade, transform: [{ translateY: slide }], alignItems: 'center' }}>
+        <Text style={styles.gameOver}>GAME OVER</Text>
+        <Text style={styles.scoreLabel}>FINAL SCORE</Text>
+        <Text style={styles.score}>{score}</Text>
+        <Text style={styles.rank}>
+          {score > 5000 ? '🏆 LEGEND' : score > 2000 ? '⭐ MASTER' : score > 500 ? '✨ ADEPT' : '🌱 NOVICE'}
+        </Text>
+
+        <TouchableOpacity style={styles.button} onPress={onRestart}>
+          <Text style={styles.buttonText}>🔄 RETRY</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.button, styles.secondary]} onPress={onMenu}>
+          <Text style={styles.buttonText}>🏠 MENU</Text>
+        </TouchableOpacity>
+      </Animated.View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0a0a1a',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gameOver: {
+    fontSize: 48,
+    fontWeight: '900',
+    color: '#ef4444',
+    letterSpacing: 6,
+    textShadowColor: '#7f1d1d',
+    textShadowRadius: 20,
+  },
+  scoreLabel: { color: '#666', fontSize: 14, letterSpacing: 4, marginTop: 40 },
+  score: {
+    fontSize: 72,
+    fontWeight: '900',
+    color: '#fff',
+    textShadowColor: '#7c3aed',
+    textShadowRadius: 30,
+  },
+  rank: { fontSize: 20, color: '#a78bfa', marginTop: 10, letterSpacing: 2 },
+  button: {
+    backgroundColor: '#7c3aed',
+    paddingHorizontal: 50,
+    paddingVertical: 16,
+    borderRadius: 40,
+    marginTop: 30,
+    borderWidth: 2,
+    borderColor: '#a78bfa',
+  },
+  secondary: { backgroundColor: '#1a1a2e', borderColor: '#333' },
+  buttonText: { color: '#fff', fontSize: 18, fontWeight: '700', letterSpacing: 2 },
+});
+import React, { useEffect, useRef } from 'react';
+import { View, Text, StyleSheet, TouchableOpacity, Animated } from 'react-native';
+
+export default function GameOver({ score, onRestart, onMenu }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  const slide = useRef(new Animated.Value(50)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fade, { toValue: 1, duration: 600, useNativeDriver: true }),
+      Animated.timing(slide, { toValue: 0, duration: 600, useNativeDriver: true }),
+    ]).start();
+  }, []);
+
+  return (
+    <View style={styles.container}>
+      <Animated.View style={{ opacity: fade, transform: [{ translateY: slide }], alignItems: 'center' }}>
+        <Text style={styles.gameOver}>GAME OVER</Text>
+        <Text style={styles.scoreLabel}>FINAL SCORE</Text>
+        <Text style={styles.score}>{score}</Text>
+        <Text style={styles.rank}>
+          {score > 5000 ? '🏆 LEGEND' : score > 2000 ? '⭐ MASTER' : score > 500 ? '✨ ADEPT' : '🌱 NOVICE'}
+        </Text>
+
+        <TouchableOpacity style={styles.button} onPress={onRestart}>
+          <Text style={styles.buttonText}>🔄 RETRY</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity style={[styles.button, styles.secondary]} onPress={onMenu}>
+          <Text style={styles.buttonText}>🏠 MENU</Text>
+        </TouchableOpacity>
+      </Animated.View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0a0a1a',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  gameOver: {
+    fontSize: 48,
+    fontWeight: '900',
+    color: '#ef4444',
+    letterSpacing: 6,
+    textShadowColor: '#7f1d1d',
+    textShadowRadius: 20,
+  },
+  scoreLabel: { color: '#666', fontSize: 14, letterSpacing: 4, marginTop: 40 },
+  score: {
+    fontSize: 72,
+    fontWeight: '900',
+    color: '#fff',
+    textShadowColor: '#7c3aed',
+    textShadowRadius: 30,
+  },
+  rank: { fontSize: 20, color: '#a78bfa', marginTop: 10, letterSpacing: 2 },
+  button: {
+    backgroundColor: '#7c3aed',
+    paddingHorizontal: 50,
+    paddingVertical: 16,
+    borderRadius: 40,
+    marginTop: 30,
+    borderWidth: 2,
+    borderColor: '#a78bfa',
+  },
+  secondary: { backgroundColor: '#1a1a2e', borderColor: '#333' },
+  buttonText: { color: '#fff', fontSize: 18, fontWeight: '700', letterSpacing: 2 },
+});
+npx create-expo-app echo-realm
+cd echo-realm
+# Replace files with the code above
+npm install
+npx expo start
+echo_realm/
+├── pubspec.yaml
+├── lib/
+│   ├── main.dart
+│   ├── theme.dart
+│   ├── models/
+│   │   ├── enemy.dart
+│   │   ├── shockwave.dart
+│   │   └── game_state.dart
+│   ├── services/
+│   │   ├── audio_service.dart
+│   │   └── game_engine.dart
+│   └── screens/
+│       ├── main_menu.dart
+│       ├── game_screen.dart
+│       └── game_over.dart
